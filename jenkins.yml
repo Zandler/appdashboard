@@ -1,0 +1,357 @@
+node(env.NODE_NAME) {
+  try {
+    stage('Input vars and env setup'){
+      def caUserInput = input(
+         id: 'caUserInput', message: 'Por favor, digite os dados necessários:', parameters: [
+         [$class: 'StringParameterDefinition', defaultValue: '', description: 'Cyberark username', name: 'ca_username'],
+         [$class: 'PasswordParameterDefinition', defaultValue: '', description: 'Cyberark password', name: 'ca_password'],
+         [$class: 'StringParameterDefinition', defaultValue: '', description: 'Pacote GMUD', name: 'gmud_package'],
+         [$class: 'StringParameterDefinition', defaultValue: '', description: 'Versão GMUD', name: 'gmud_version'],
+         [$class: 'BooleanParameterDefinition', defaultValue: false, description: 'Rollback(Weblogic, ODI, DB)?', name: 'gmud_rollback']
+
+      ])
+
+      env.CA_USER = caUserInput['ca_username']
+      env.CA_PASSWD = caUserInput['ca_password']
+      env.ID_GMUD = caUserInput['gmud_package']
+      env.VERSION_GMUD = caUserInput['gmud_version']
+      env.PRIVATE_SSH_KEY = '/var/lib/jenkins/secrets/ansible.pem'
+
+      env.AF_WORKSPACE = pwd() + "/" + env.BUILD_NUMBER
+
+      // Repositórios de HTI e PRD do ARTIFACTORY
+      env.REPO_HTI = 'gn_hti_plt_risco'
+      env.REPO_PRD = 'gn_prd_plt_risco'
+      env.BASE_NAME_ARTIFACT = 'plt_risco'
+      env.JOB_BUILD_NAME = env.ID_GMUD + "-" + env.VERSION_GMUD
+      env.ARTIFACT_NAME = env.BASE_NAME_ARTIFACT + '-' + env.VERSION_GMUD
+      env.AF_DIR_DONE = 'finalizados'
+      env.AF_DIR_ROLLBACK = 'rollback'
+
+      // Weblogic
+      env.WL_ADMIN_USER = caUserInput['ca_username']
+      env.WL_ADMIN_PASSWD = caUserInput['ca_password']
+      env.WL_ROLLBACK = caUserInput['gmud_rollback']
+      env.WL_AMBIENTE = "DPL"
+      env.WL_LIB_FULL_CLIENT = "/u01/oracle/middleware_12.1.3/wlserver/server/lib/wlfullclient.jar"
+      env.WL_TARGETS = "plt_risco_cluster" //para o wlfullclient.jar
+      env.WL_DOMAIN = "plt_risco_domain"
+      env.WL_DIR_ADMIN_SERVER = "AdminServerPltRiscoDeploy"
+      env.WL_DIR_BACKUP = "/u02/backup"
+      env.WL_DIR_UPLOAD = "/u01/deploy/projects/domains/" + env.WL_DOMAIN + "/servers/" + env.WL_DIR_ADMIN_SERVER + "/upload"
+      env.WL_UPLOAD_DIR_SRC = env.AF_WORKSPACE + "/gmud/wl"
+      env.WL_ADMIN= "gn1252cb"
+      env.TARGET_SERVERS_WL = "gn1252cb" //separados por ,
+      env.WL_ADMIN_PORT = "9201"
+
+      // SOA
+      env.URL_SERVER_SOA = 'http://soa-hk-adm-cb.getnet.com.br:7111'
+      env.AMBIENTE_SOA = 'DPL'
+      env.TARGET_SERVERS_SOA = 'gn1558cb' //separado por virgulas(ex: gn1558cb,gn1559cb)
+
+      // OSB
+      env.URL_SERVER_OSB = 't3://osb-hk-adm-cb.getnet.com.br:7101'
+      env.AMBIENTE_OSB = 'DPL'
+      env.TARGET_SERVERS_OSB = 'gn1560cb' //separado por virgulas(ex: gn1560cb,gn1561cb)
+
+      // ODI
+      env.TARGET_SERVERS_ODI = '10.11.140.21' //separado por virgulas(ex: gn1560cb,gn1561cb)
+      env.PROJECT_DIR_ODI_BIN = '/u02/app/middleware/Oracle_ODI1/oracledi/agent/bin'
+      env.ODI_ROLLBACK = caUserInput['gmud_rollback']
+      env.IMPORT_MODE = ''
+
+      // DATABASE
+      env.TARGET_SERVERS_DATABASE = 'gn884cb'
+      env.DB_ROLLBACK = caUserInput['gmud_rollback']
+
+      // Diretórios
+      env.GMUD_DIR = env.AF_WORKSPACE + "/gmud"
+      env.UPLOAD_DIR_SOA = env.AF_WORKSPACE + "/gmud/soa"
+      env.UPLOAD_DIR_OSB = env.AF_WORKSPACE + "/gmud/osb"
+      env.UPLOAD_DIR_ODI = env.AF_WORKSPACE + "/gmud/odi"
+      env.UPLOAD_DIR_DATABASE = env.AF_WORKSPACE + "/gmud/database"
+      env.DIR_SCRIPTS = env.AF_WORKSPACE + "/scripts"
+      env.DIR_JENKINS_SCRIPTS = env.DIR_SCRIPTS + "/jenkins"
+      env.DIR_ANSIBLE_PLAYBOOKS = env.DIR_SCRIPTS + "/ansible"
+
+    }
+    stage('Download artifacts and scripts') {
+
+      sh "mkdir ${env.AF_WORKSPACE}"
+      sh "mkdir ${env.GMUD_DIR}"
+      sh "mkdir ${env.DIR_SCRIPTS}"
+
+      sh "jfrog rt config --url ssh://gn1876cb:1339 --ssh-key-path /var/lib/jenkins/secrets/jentinks_getnet"
+      sh "echo Downloading to: ${env.DIR_SCRIPTS}"
+      sh "jfrog rt dl scripts/jenkins/*.sh ${env.DIR_SCRIPTS}/"
+      sh "chmod -R u+rx ${env.DIR_SCRIPTS}"
+      sh "echo Downloading to: ${env.DIR_ANSIBLE_PLAYBOOKS}"
+      sh "jfrog rt dl scripts/ansible/ansible_deploy.zip ${env.DIR_SCRIPTS}/"
+      sh "cd ${env.DIR_ANSIBLE_PLAYBOOKS}/ && unzip -x *.zip"
+
+      if(env.WL_ROLLBACK == "false" && env.ODI_ROLLBACK == "false" && env.DB_ROLLBACK == "false") {
+        env.GLOBAL_ACTION = 'deploy'
+
+        // Descricao do build
+        currentBuild.displayName = env.JOB_BUILD_NAME
+
+        sh "${env.DIR_JENKINS_SCRIPTS}/./get_artifacts_by_version.sh"
+        // Stage deploy
+
+        stage('Beginning to deploy') {
+            def SERVICOS = sh(
+              script: "cat ${env.AF_WORKSPACE}/gmud/roteiro.txt",
+              returnStdout: true
+            ).trim()
+
+            servicos = SERVICOS.split("[\\r\\n]+")
+            for(i = 0; i < servicos.size(); i++) {
+              switch((String)servicos[i]) {
+                case "wl":
+                  deployWeblogic()
+                  //echo "Deploy weblogic!"
+                  break
+
+                case "soa":
+                  deploySOA()
+                  //echo "Deploy SOA!"
+                  break
+
+                case "osb":
+                  deployOSB()
+                  //echo "Deploy OSB!"
+                  break
+
+                case "odi":
+                  deployODI()
+                  //echo "Deploy ODI!"
+                  break
+
+                case "database":
+                  deployDATABASE()
+                  //echo "Deploy DATABASE!"
+                  break
+
+                default:
+                  echo "Não conheço o tipo de deploy!"
+                break
+              }
+            }
+        }
+
+      } else {
+        env.GLOBAL_ACTION = 'rollback'
+
+        // Pega rollback.txt da pasta de rollback do artifactory
+        sh "${env.DIR_JENKINS_SCRIPTS}/./get_rollback_file.sh"
+
+        // Stage rollback
+        stage('Beginning to rollback') {
+          echo "Efetuando rollback..."
+
+          def SERVICOS_ROLLBACK = sh(
+            script: "cat ${env.AF_WORKSPACE}/gmud/rollback/rollback.txt",
+            returnStdout: true
+          ).trim()
+
+          def VERSION_ROLLBACK = sh(
+            script: "cat ${env.AF_WORKSPACE}/gmud/rollback/last_version.txt",
+            returnStdout: true
+          ).trim()
+
+          servicos_rollback = SERVICOS_ROLLBACK.split("[\\r\\n]+")
+
+          lastVersionBuildOK = VERSION_ROLLBACK.split("[\\r\\n]+")
+
+          // Descricao do build
+          currentBuild.displayName = lastVersionBuildOK[0] + "[rollback]"
+
+          for(i = 0; i < servicos_rollback.size(); i++) {
+            switch((String)servicos_rollback[i]) {
+              case "wl":
+                deployWeblogic()
+                break
+
+              case "odi":
+                deployODI()
+                break
+
+              case "database":
+                deployDATABASE()
+                break
+
+              default:
+                echo "Não há rollback para o tipo " + servicos_rollback[i]
+              break
+            }
+          }
+
+        }
+      }
+    }
+
+    if(env.GLOBAL_ACTION == 'deploy') {
+      stage('Promoting artifact') {
+        env.TYPE_PROMOTION = 'DEPLOY'
+        sh "${env.DIR_JENKINS_SCRIPTS}/./promote_artifact_by_version.sh"
+      }
+    } else {
+      env.TYPE_PROMOTION = 'ROLLBACK'
+      currentBuild.result = 'UNSTABLE'
+    }
+
+  } catch (e) {
+    currentBuild.result = "FAILED"
+    throw e
+  } finally {
+    sh "${env.DIR_JENKINS_SCRIPTS}/./cleanup.sh"
+  }
+}
+
+def deployWeblogic() {
+  def ACTION = "deploy"
+  def STATUS_ACTION = "backup"
+
+  if(env.WL_ROLLBACK == "true") {
+    ACTION = "rollback"
+    STATUS_ACTION = "restore"
+  }
+
+  def extraVars = "userWL=${env.CA_USER} passwordWL=${env.CA_PASSWD} weblogicAdminPort=${env.WL_ADMIN_PORT} "
+  extraVars += "ambienteWL=${env.WL_AMBIENTE} weblogicDirUploadSrc=${env.WL_UPLOAD_DIR_SRC} "
+  extraVars += "weblogicDirUpload=${env.WL_DIR_UPLOAD} weblogicAdmin=${env.WL_ADMIN} "
+  extraVars += "weblogicDirAdminServer=${env.WL_DIR_ADMIN_SERVER} weblogicTargets=${env.WL_TARGETS} "
+  extraVars += "weblogicDomain=${env.WL_DOMAIN} weblogicDirBackup=${env.WL_DIR_BACKUP} "
+  extraVars += "weblogicLibFullClientJar=${env.WL_LIB_FULL_CLIENT} "
+  extraVars += "jenkinsAction=${STATUS_ACTION} idGmud=${env.ID_GMUD} "
+  extraVars += "versionGmud=${env.VERSION_GMUD}"
+
+  // Ansible inventory
+  def targets = env.TARGET_SERVERS_WL + ","
+
+  echo "Efetuando ${STATUS_ACTION} das apps..."
+
+  sh "cd ${env.DIR_ANSIBLE_PLAYBOOKS} && ansible-playbook -i ${targets} --user oracle --private-key ${env.PRIVATE_SSH_KEY} --extra-vars='${extraVars}' weblogic.yml -t ${ACTION} -vv"
+}
+
+def deploySOA() {
+  echo "Executando deploy do SOA..."
+  def extraVars = "userSOA=${env.CA_USER} passwordSOA=${env.CA_PASSWD} "
+  extraVars += "ambienteSOA=${env.AMBIENTE_SOA} uploadDIR=${env.UPLOAD_DIR_SOA} "
+  extraVars += "urlServerSOA=${env.URL_SERVER_SOA}"
+
+  // Ansible inventory
+  def targets = env.TARGET_SERVERS_SOA + ","
+
+  sh "cd ${env.DIR_ANSIBLE_PLAYBOOKS} && ansible-playbook -i ${targets} --user oracle --private-key ${env.PRIVATE_SSH_KEY} --extra-vars='${extraVars}' soa.yml -vv"
+}
+
+def deployOSB() {
+  echo "Executando deploy do OSB...";
+  def extraVars = "userOSB=${env.CA_USER} passwordOSB=${env.CA_PASSWD} "
+  extraVars += "ambienteOSB=${env.AMBIENTE_OSB} uploadDIR=${env.UPLOAD_DIR_OSB} "
+  extraVars += "urlServerOSB=${env.URL_SERVER_OSB}"
+
+  // Ansible inventory
+  def targets = env.TARGET_SERVERS_OSB + ","
+
+  sh "cd ${env.DIR_ANSIBLE_PLAYBOOKS} && ansible-playbook -i ${targets} --user oracle --private-key ${env.PRIVATE_SSH_KEY} --extra-vars='${extraVars}' osb.yml -vv"
+}
+
+def deployODI() {
+  def tags = env.GLOBAL_ACTION
+  echo "Executando ${env.GLOBAL_ACTION} do ODI..."
+
+  def extraVars = "uploadDIR=${env.UPLOAD_DIR_ODI} importMode=${env.IMPORT_MODE} "
+  extraVars += "project_dir_odi_bin=${env.PROJECT_DIR_ODI_BIN} globalAction=${env.GLOBAL_ACTION}"
+
+  // Ansible inventory
+  def targets = env.TARGET_SERVERS_ODI + ","
+
+  sh "cd ${env.DIR_ANSIBLE_PLAYBOOKS} && ansible-playbook -i ${targets} --user oracle --private-key ${env.PRIVATE_SSH_KEY} --extra-vars='${extraVars}' odi.yml -t ${tags} -vv"
+}
+
+def deployDATABASE() {
+  def tags = env.GLOBAL_ACTION
+  def DATABASE = sh(
+        script: "cat ${env.UPLOAD_DIR_DATABASE}/servicos.txt",
+        returnStdout: true
+        ).trim()
+
+  database = DATABASE.split("[\\r\\n]+")
+  database_namefile_change = DATABASE.split("[\\r\\n]+")
+  database_name_servers = DATABASE.split("[\\r\\n]+")
+
+  deploy_ansible_database()
+}
+
+//verifica se existem arquivos contido em database_files.txt
+def verify_database_files() {
+  echo "verifica se arquivos existem conforme database_files.txt"
+  for(i = 0; i < database.size(); i++) {
+    if (!fileExists("${env.UPLOAD_DIR_DATABASE}/${database[i]}")) {
+      error ("Arquivo  ${database[i]} nao encontrado")
+    } else echo("Arquivo  ${database[i]} encontrado")
+  }
+}
+
+def verify_mudanca_rollback() {
+  //verifica se há rollback par cada mudanca"
+  for(i = 0; i < database_namefile_change.size(); i++) {
+    database_namefile_split = "${database_namefile_change[i]}".tokenize('_.')
+    if ("${database_namefile_split[2]}" == "mudanca") {
+      echo "Arquivo de nome: ${database[i]} encontrado. verificando se ha rollback"
+      if (("${database_namefile_split[3]}" ==  "create") && (!database_namefile_change.contains("${database_namefile_split[0]}_${database_namefile_split[1]}_rollback_delete.${database_namefile_split[4]}"))) {
+        error ("Arquivo de rollback para ${database[i]} nao encontrado")
+      }
+      if (("${database_namefile_split[3]}" ==  "insert") && (!database_namefile_change.contains("${database_namefile_split[0]}_${database_namefile_split[1]}_rollback_drop.${database_namefile_split[4]}"))) {
+        error ("Arquivo de rollback para ${database[i]} nao encontrado")
+      }
+      if (("${database_namefile_split[3]}" ==  "procedure") && (!database_namefile_change.contains("${database_namefile_split[0]}_${database_namefile_split[1]}_rollback_procedure.${database_namefile_split[4]}"))) {
+        error ("Arquivo de rollback para ${database[i]} nao encontrado")
+      }
+    }
+  }
+}
+
+def deploy_ansible_database() {
+  echo "Ëntrou no deply do banco ansible"
+  def tags = env.GLOBAL_ACTION
+
+  if(env.GLOBAL_ACTION == 'deploy') {
+    verify_database_files()
+    verify_mudanca_rollback()
+    if ("${database_name_servers}".contains("RISCO")) {
+      def db_env = "RISCO"
+      def db_script_action = "mudanca"
+      def extraVars = "db_env=${db_env} db_uploadDIR=${env.UPLOAD_DIR_DATABASE} db_script_action= ${db_script_action} "
+
+      sh "cd ${env.DIR_ANSIBLE_PLAYBOOKS} && ansible-playbook -i gn884cb,  --user oracle --private-key ${env.PRIVATE_SSH_KEY} --extra-vars='${extraVars}' -t ${tags} -vv database.yml"
+    }
+
+    if ("${database_name_servers}".contains("INTEGRACAO")) {
+      def db_env = "INTEGRACAO"
+      def db_script_action = "mudanca"
+      def extraVars = "db_env=${db_env} db_uploadDIR=${env.UPLOAD_DIR_DATABASE} db_script_action= ${db_script_action} "
+
+      sh "cd ${env.DIR_ANSIBLE_PLAYBOOKS} && ansible-playbook -i gn884cb,  --user oracle --private-key ${env.PRIVATE_SSH_KEY} --extra-vars='${extraVars}' -t ${tags} -vv database.yml"
+    }
+  } else  {
+      env.GLOBAL_ACTION == 'rollback'
+      if ("${database_name_servers}".contains("RISCO")) {
+        def db_env = "INTEGRACAO"
+        def db_script_action = "rollback"
+        def extraVars = "db_env=${db_env} db_uploadDIR=${env.UPLOAD_DIR_DATABASE} db_script_action= ${db_script_action} "
+
+        sh "cd ${env.DIR_ANSIBLE_PLAYBOOKS} && ansible-playbook -i gn884cb,  --user oracle --private-key ${env.PRIVATE_SSH_KEY} --extra-vars='${extraVars}' -t rollback -vv database.yml"
+      }
+
+      if ("${database_name_servers}".contains("INTEGRACAO")) {
+        def db_env = "INTEGRACAO"
+        def db_script_action = "rollback"
+        def extraVars = "db_env=${db_env} db_uploadDIR=${env.UPLOAD_DIR_DATABASE} db_script_action= ${db_script_action} "
+
+        sh "cd ${env.DIR_ANSIBLE_PLAYBOOKS} && ansible-playbook -i gn884cb,  --user oracle --private-key ${env.PRIVATE_SSH_KEY} --extra-vars='${extraVars}' -t rollback -vv database.yml"
+      }
+    }
+}
